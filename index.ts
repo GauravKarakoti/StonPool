@@ -269,57 +269,56 @@ bot.on("callback_query:data", async (ctx) => {
         // 1. Send data to PostgreSQL
         const voteResult = await castVote(ctx.from.id, chatId, proposalId, support);
 
-        // 2. Handle unauthorized clicks (Alert popup)
+        // 2. Handle unauthorized clicks OR already voted (Alert popup)
         if (!voteResult.success) {
-            await ctx.answerCallbackQuery({ text: voteResult.message!, show_alert: true }).catch(err => console.warn("Could not answer callback (likely expired):", err.message));
+            await ctx.answerCallbackQuery({ text: voteResult.message!, show_alert: true }).catch(err => console.warn("Could not answer callback:", err.message));
             return;
         }
 
+        // 3. User-Specific Update: Show a private alert to the voter with the live tally
         await ctx.answerCallbackQuery({ 
-            text: `✅ Vote recorded: ${support ? 'Approve' : 'Reject'}` 
-        }).catch(err => console.warn("Could not answer callback (likely expired):", err.message));
+            text: `✅ Vote recorded: ${support ? 'Approve' : 'Reject'}\n\nCurrent Tally:\n👍 ${voteResult.yesVotes} | 👎 ${voteResult.noVotes}\nQuorum: ${voteResult.totalVotes}/${voteResult.requiredQuorum}`,
+            show_alert: true 
+        }).catch(err => console.warn("Could not answer callback:", err.message));
 
-        // 4. Rebuild the Live Dashboard UI
         const p = voteResult.proposal!;
-        let responseText = 
-            `📋 **Proposal #${p.id}**\n\n` +
-            `**Action:** ${p.action}\n` +
-            `**Amount:** ${p.amount} ${p.tokenIn}\n` +
-            (p.tokenOut ? `**Target Asset:** ${p.tokenOut}\n` : "") +
-            (p.platform ? `**Protocol:** ${p.platform}\n` : "") +
-            `\n📊 **Live Tally:**\n` +
-            `👍 Approve: ${voteResult.yesVotes}\n` +
-            `👎 Reject: ${voteResult.noVotes}\n` +
-            `_Quorum: ${voteResult.totalVotes} / ${voteResult.requiredQuorum} required_`;
 
-        // 5. Update the message state based on Quorum
+        // 4. Update the public message state based on Quorum
         if (voteResult.newStatus === 'ACTIVE') {
-            // Still active? Keep the buttons.
+            // Still active? Update ONLY the inline keyboard buttons to show the tally.
+            // This prevents the original message text (and AI summary) from being wiped out!
             const votingKeyboard = new InlineKeyboard()
-                .text("👍 Approve", `v_yes_${p.id}`)
-                .text("👎 Reject", `v_no_${p.id}`);
+                .text(`👍 Approve (${voteResult.yesVotes})`, `v_yes_${p.id}`)
+                .text(`👎 Reject (${voteResult.noVotes})`, `v_no_${p.id}`);
                 
-            await ctx.editMessageText(responseText, { 
-                parse_mode: "Markdown", 
+            await ctx.editMessageReplyMarkup({ 
                 reply_markup: votingKeyboard 
             });
         } else {
-            // Quorum reached!
+            // Quorum reached! Rebuild the final conclusion text
+            let responseText = 
+                `📋 **Proposal #${p.id}**\n\n` +
+                `**Action:** ${p.action}\n` +
+                `**Amount:** ${p.amount} ${p.tokenIn}\n` +
+                (p.tokenOut ? `**Target Asset:** ${p.tokenOut}\n` : "") +
+                (p.platform ? `**Protocol:** ${p.platform}\n` : "") +
+                `\n📊 **Final Tally:**\n` +
+                `👍 Approve: ${voteResult.yesVotes}\n` +
+                `👎 Reject: ${voteResult.noVotes}\n` +
+                `_Quorum: ${voteResult.totalVotes} / ${voteResult.requiredQuorum} reached_`;
+
             const statusIcon = voteResult.newStatus === 'PASSED' ? '✅' : '❌';
             responseText += `\n\n🏁 **Voting Concluded: ${voteResult.newStatus} ${statusIcon}**`;
             
-            // Generate a UI preview of the payload for ALL supported actions
+            // Generate a UI preview of the payload
             if (voteResult.newStatus === 'PASSED') {
                 try {
-                    // 1. Initialize RPC client (Defaults to Mainnet)
                     const endpoint = await getHttpEndpoint();
                     const client = new TonClient({ endpoint });
 
-                    // 2. Fetch the DAO's unique Treasury
                     const treasuryAddressStr = await getGroupTreasuryAddress(chatId);
                     if (!treasuryAddressStr) throw new Error("Treasury missing.");
 
-                    // 3. Route to the correct Dynamic Payload Builder for UI transparency
                     let payloadResult;
 
                     if (p.action === 'SWAP') {
@@ -328,7 +327,7 @@ bot.on("callback_query:data", async (ctx) => {
                         );
                     } 
                     else if (p.action === 'STAKE') {
-                        const pairedToken = p.tokenOut || "USDT"; // Default pairing
+                        const pairedToken = p.tokenOut || "USDT";
                         payloadResult = await getDynamicLpPayload(
                             client, treasuryAddressStr, p.tokenIn, pairedToken, p.amount
                         );
@@ -337,7 +336,6 @@ bot.on("callback_query:data", async (ctx) => {
                         payloadResult = buildNativeTransferPayload(p.amount);
                     }
 
-                    // 4. Print the generated cell to the chat
                     if (payloadResult) {
                         responseText += `\n\n⚙️ **Execution Payload Generated:**\n\`${payloadResult.bocBase64}\``;
                         responseText += `\n_Gas Required: ~${payloadResult.forwardTon} TON_`;

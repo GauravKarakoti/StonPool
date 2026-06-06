@@ -71,8 +71,8 @@ export async function fetchSwapQuote(tokenIn: string, tokenOut: string, amount: 
     const offerAsset = await resolveAsset(tokenIn);
     const askAsset = await resolveAsset(tokenOut);
 
-    if (!offerAsset) return { success: false, message: `⚠️ Could not find a safe STON.fi registry entry for **${tokenIn}**.` };
-    if (!askAsset) return { success: false, message: `⚠️ Could not find a safe STON.fi registry entry for **${tokenOut}**.` };
+    if (!offerAsset) return { success: false, message: ` Could not find a safe STON.fi registry entry for **${tokenIn}**.` };
+    if (!askAsset) return { success: false, message: ` Could not find a safe STON.fi registry entry for **${tokenOut}**.` };
 
     // Convert human amount to nano-units
     const units = Math.floor(amount * Math.pow(10, offerAsset.decimals)).toString();

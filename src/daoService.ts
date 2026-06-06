@@ -165,7 +165,7 @@ export async function createProposal(
         const group = await prisma.group.findUnique({ where: { telegramChatId: BigInt(chatTgId) } });
 
         if (!user || !group) {
-            return { success: false, message: "❌ System error: User or Group record missing." };
+            return { success: false, message: "❌ System error: You aren't a member of the DAO." };
         }
 
         // 2. Security Enforcement: Verify the user is an active DAO Member
@@ -215,7 +215,7 @@ export async function castVote(
         const user = await prisma.user.findUnique({ where: { telegramId: BigInt(userTgId) } });
         const group = await prisma.group.findUnique({ where: { telegramChatId: BigInt(chatTgId) } });
 
-        if (!user || !group) return { success: false, message: "❌ System error: Record missing." };
+        if (!user || !group) return { success: false, message: "❌ System error: You are not a member of the DAO." };
 
         // 2. Verify Active Membership
         const membership = await prisma.groupMember.findUnique({
@@ -231,16 +231,23 @@ export async function castVote(
         if (!proposal) return { success: false, message: "❌ Proposal not found." };
         if (proposal.status !== 'ACTIVE') return { success: false, message: "⏳ Voting has already concluded for this proposal." };
 
-        // 4. Record the Vote (Upsert allows changing votes)
-        await prisma.vote.upsert({
+        // 4. CHECK IF USER ALREADY VOTED (Prevents double voting)
+        const existingVote = await prisma.vote.findUnique({
             where: {
                 proposalId_userId: { proposalId: proposal.id, userId: user.id }
-            },
-            update: { support },
-            create: { proposalId: proposal.id, userId: user.id, support }
+            }
         });
 
-        // 5. Calculate Quorum and Tally
+        if (existingVote) {
+            return { success: false, message: "⚠️ You have already voted on this proposal." };
+        }
+
+        // 5. Record the Vote (Locked in)
+        await prisma.vote.create({
+            data: { proposalId: proposal.id, userId: user.id, support }
+        });
+
+        // 6. Calculate Quorum and Tally
         const totalEligible = await prisma.groupMember.count({
             where: { groupId: group.id, joinStatus: 'APPROVED' }
         });
@@ -256,7 +263,7 @@ export async function castVote(
 
         let newStatus = proposal.status;
 
-        // 6. Conclude Voting if Quorum is met
+        // 7. Conclude Voting if Quorum is met
         if (quorumReached) {
             newStatus = yesVotes > noVotes ? 'PASSED' : 'REJECTED';
             await prisma.proposal.update({
