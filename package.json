@@ -1,0 +1,48 @@
+{
+    "name": "stonpool",
+    "version": "0.0.1",
+    "scripts": {
+        "bp": "blueprint",
+        "start": "ts-node index.ts",
+        "start:contract": "blueprint run",
+        "dev": "tsx watch index.ts",
+        "build": "blueprint build",
+        "test": "jest --verbose",
+        "release": "blueprint pack && npm publish --access public",
+        "db:gen": "prisma generate",
+        "db:migrate": "prisma migrate dev",
+        "db:push": "prisma db push"
+    },
+    "dependencies": {
+        "@orbs-network/ton-access": "^2.3.3",
+        "@prisma/adapter-pg": "^7.8.0",
+        "@prisma/client": "^7.8.0",
+        "@ston-fi/sdk": "^2.7.0",
+        "@ton/core": "^0.63.1",
+        "dotenv": "^17.4.2",
+        "grammy": "^1.43.0",
+        "groq-sdk": "^1.2.1",
+        "pg": "^8.21.0",
+        "prisma": "^7.8.0",
+        "tsx": "^4.22.4",
+        "zod": "^4.4.3"
+    },
+    "devDependencies": {
+        "@tact-lang/compiler": ">=1.6.13 <2.0.0",
+        "@ton-community/func-js": ">=0.10.0",
+        "@ton/blueprint": ">=0.40.0",
+        "@ton/crypto": "^3.3.0",
+        "@ton/sandbox": ">=0.37.0",
+        "@ton/test-utils": ">=0.11.0",
+        "@ton/tolk-js": ">=1.0.0",
+        "@ton/ton": "^16.3.0",
+        "@types/jest": "^30.0.0",
+        "@types/node": "^22.19.20",
+        "@types/pg": "^8.20.0",
+        "jest": "^30.0.5",
+        "prettier": "^3.6.2",
+        "ts-jest": "^29.4.1",
+        "ts-node": "^10.9.2",
+        "typescript": "^5.9.3"
+    }
+}

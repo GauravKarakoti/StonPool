@@ -1,0 +1,118 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// --- ENUMS ---
+
+// Defines the user's power level within a specific group's DAO
+enum Role {
+  ADMIN       // Can configure DAO, approve members
+  DAO_MEMBER  // Can vote, propose, deposit
+  GUEST       // Regular Telegram member, can only view
+}
+
+// Tracks the state of a user's /join_dao request
+enum RequestStatus {
+  NONE
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+// --- MODELS ---
+
+model User {
+  id              Int           @id @default(autoincrement())
+  telegramId      BigInt        @unique // Telegram IDs can be huge, always use BigInt
+  username        String?
+  firstName       String?
+  tonWallet       String?       @unique // Linked when they first request to join a DAO
+  
+  // Relations
+  memberships     GroupMember[]
+  proposals       Proposal[]
+  votes           Vote[]
+  
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+}
+
+model Group {
+  id              Int           @id @default(autoincrement())
+  telegramChatId  BigInt        @unique // The Telegram Group Chat ID
+  name            String
+  
+  // Relations
+  members         GroupMember[]
+  treasury        Treasury?     // 1-to-1 relation with a Treasury
+  proposals       Proposal[]
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+}
+
+// The core Permissioned Layer mapping Users to Groups
+model GroupMember {
+  id              Int           @id @default(autoincrement())
+  userId          Int
+  groupId         Int
+  
+  role            Role          @default(GUEST)
+  joinStatus      RequestStatus @default(NONE)
+  
+  user            User          @relation(fields: [userId], references: [id])
+  group           Group         @relation(fields: [groupId], references: [id])
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  // A user can only have one membership record per group
+  @@unique([userId, groupId]) 
+}
+
+// Stub for the Treasury (to be expanded later)
+model Treasury {
+  id              Int           @id @default(autoincrement())
+  groupId         Int           @unique
+  contractAddress String?       @unique // The TON smart contract address
+  quorumThreshold Int           @default(60) // e.g., 60%
+  
+  group           Group         @relation(fields: [groupId], references: [id])
+}
+
+model Proposal {
+  id              Int           @id @default(autoincrement())
+  groupId         Int
+  proposerId      Int
+  text            String        // The raw natural language message
+  action          String        // SWAP, STAKE, TRANSFER
+  amount          Float
+  tokenIn         String
+  tokenOut        String?
+  platform        String?
+  destination     String?
+  status          String        @default("ACTIVE") // ACTIVE, EXECUTED, FAILED
+
+  group           Group         @relation(fields: [groupId], references: [id])
+  proposer        User          @relation(fields: [proposerId], references: [id])
+  votes           Vote[]
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+}
+
+model Vote {
+  id              Int           @id @default(autoincrement())
+  proposalId      Int
+  userId          Int
+  support         Boolean       // true for approve, false for reject
+  
+  proposal        Proposal      @relation(fields: [proposalId], references: [id])
+  user            User          @relation(fields: [userId], references: [id])
+
+  @@unique([proposalId, userId]) // One vote per user per proposal
+}
