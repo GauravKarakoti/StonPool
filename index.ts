@@ -1,4 +1,4 @@
-import { Bot, GrammyError, HttpError, InlineKeyboard } from "grammY";
+import { Bot, GrammyError, HttpError, InlineKeyboard } from "grammy";
 import * as dotenv from "dotenv";
 import { processJoinDaoRequest, saveUserWallet, resolveJoinRequest, createProposal, castVote, getGroupTreasuryAddress } from "./src/daoService";
 import { parseProposalIntent } from "./src/aiService";
@@ -7,10 +7,12 @@ import { buildNativeTransferPayload, getDynamicLpPayload, getDynamicSwapPayload 
 import { startExecutionWorker } from "./src/workerService";
 import { getHttpEndpoint } from "@orbs-network/ton-access";
 import { TonClient } from "@ton/ton";
+import express from "express";
 
 dotenv.config();
 
 const bot = new Bot(process.env.BOT_TOKEN as string);
+const app = express();
 
 bot.on("message:text", async (ctx) => {
     const text = ctx.message.text;
@@ -208,11 +210,11 @@ bot.on("callback_query:data", async (ctx) => {
         try {
             const chatMember = await ctx.api.getChatMember(targetGroupId, clickerId);
             if (!['administrator', 'creator'].includes(chatMember.status)) {
-                await ctx.answerCallbackQuery({ text: "⛔ You are no longer an Admin of this group!", show_alert: true }).catch(err => console.warn("Could not answer callback (likely expired):", err.message));
+                await ctx.answerCallbackQuery({ text: "⛔ You are no longer an Admin of this group!", show_alert: true }).catch((err: any) => console.warn("Could not answer callback (likely expired):", err.message));
                 return;
             }
         } catch (error) {
-            await ctx.answerCallbackQuery({ text: "⛔ Error verifying admin status. The bot might have been removed from the group.", show_alert: true }).catch(err => console.warn("Could not answer callback (likely expired):", err.message));
+            await ctx.answerCallbackQuery({ text: "⛔ Error verifying admin status. The bot might have been removed from the group.", show_alert: true }).catch((err: any) => console.warn("Could not answer callback (likely expired):", err.message));
             return;
         }
 
@@ -220,7 +222,7 @@ bot.on("callback_query:data", async (ctx) => {
         const success = await resolveJoinRequest(targetTgId, targetGroupId, action);
 
         if (success) {
-            await ctx.answerCallbackQuery({ text: `Request ${action === 'APPROVE' ? 'Approved' : 'Rejected'}!` }).catch(err => console.warn("Could not answer callback (likely expired):", err.message));
+            await ctx.answerCallbackQuery({ text: `Request ${action === 'APPROVE' ? 'Approved' : 'Rejected'}!` }).catch((err: any) => console.warn("Could not answer callback (likely expired):", err.message));
 
             // --- FETCH USER FOR MENTION ---
             let targetMention = `[User](tg://user?id=${targetTgId})`; // Fallback
@@ -254,7 +256,7 @@ bot.on("callback_query:data", async (ctx) => {
             }
 
         } else {
-            await ctx.answerCallbackQuery({ text: "❌ Database error occurred.", show_alert: true }).catch(err => console.warn("Could not answer callback (likely expired):", err.message));
+            await ctx.answerCallbackQuery({ text: "❌ Database error occurred.", show_alert: true }).catch((err: any) => console.warn("Could not answer callback (likely expired):", err.message));
         }
     }
 
@@ -271,7 +273,7 @@ bot.on("callback_query:data", async (ctx) => {
 
         // 2. Handle unauthorized clicks OR already voted (Alert popup)
         if (!voteResult.success) {
-            await ctx.answerCallbackQuery({ text: voteResult.message!, show_alert: true }).catch(err => console.warn("Could not answer callback:", err.message));
+            await ctx.answerCallbackQuery({ text: voteResult.message!, show_alert: true }).catch((err: any) => console.warn("Could not answer callback:", err.message));
             return;
         }
 
@@ -279,7 +281,7 @@ bot.on("callback_query:data", async (ctx) => {
         await ctx.answerCallbackQuery({ 
             text: `✅ Vote recorded: ${support ? 'Approve' : 'Reject'}\n\nCurrent Tally:\n👍 ${voteResult.yesVotes} | 👎 ${voteResult.noVotes}\nQuorum: ${voteResult.totalVotes}/${voteResult.requiredQuorum}`,
             show_alert: true 
-        }).catch(err => console.warn("Could not answer callback:", err.message));
+        }).catch((err: any) => console.warn("Could not answer callback:", err.message));
 
         const p = voteResult.proposal!;
 
@@ -341,7 +343,7 @@ bot.on("callback_query:data", async (ctx) => {
                         responseText += `\n_Gas Required: ~${payloadResult.forwardTon} TON_`;
                     }
 
-                } catch (err) {
+                } catch (err: any) {
                     console.error("UI Payload preview error:", err);
                     responseText += `\n\n⚠️ *Payload preview generation pending background execution...*`;
                 }
@@ -353,7 +355,7 @@ bot.on("callback_query:data", async (ctx) => {
     }
 });
 
-bot.catch((err) => {
+bot.catch((err: any) => {
     const ctx = err.ctx;
     console.error(`[Error] Update ${ctx.update.update_id} failed:`);
     const e = err.error;
@@ -367,8 +369,12 @@ bot.catch((err) => {
 });
 
 bot.start({
-    onStart: (botInfo) => {
+    onStart: (botInfo: any) => {
         console.log(`🚀 StonPool Bot (@${botInfo.username}) is running!`);
         startExecutionWorker(); // Ignite the background process
     },
+});
+
+app.listen(3000, () => {
+    console.log(`🌐 Express server is listening on port 3000`);
 });
