@@ -177,6 +177,22 @@ bot.on("message:text", async (ctx) => {
     }
 });
 
+bot.on("message:new_chat_members", async (ctx) => {
+  const newMembers = ctx.message.new_chat_members;
+
+  for (const member of newMembers) {
+    // Optional: Prevent the bot from welcoming other bots
+    if (member.is_bot) continue;
+
+    const userName = member.username ? `@${member.username}` : member.first_name;
+    
+    const welcomeMessage = `Welcome to the group, ${userName}! 🎉\n\nIf you want to be a part of the DAO, you can use the /join_dao command.`;
+
+    // Send the welcome message to the group
+    await ctx.reply(welcomeMessage);
+  }
+});
+
 bot.on("callback_query:data", async (ctx) => {
     const data = ctx.callbackQuery.data;
     const clickerId = ctx.from.id;
