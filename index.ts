@@ -151,7 +151,7 @@ bot.on("message:text", async (ctx) => {
             if (intent.action === "SWAP") {
                 actionSpecificDetails = (intent.tokenOut ? `**Target Asset:** ${intent.tokenOut}\n` : "") + dexQuoteText;
             } else if (intent.action === "STAKE") {
-                actionSpecificDetails = `**Protocol:** ${intent.platform || "Tonstakers"}\n**Expected Yield:** ~4.5% APY\n`;
+                actionSpecificDetails = `**Protocol:** ${intent.platform || "STON.fi"}\n**Expected Yield:** ~4.5% APY\n`;
             } else if (intent.action === "TRANSFER") {
                 actionSpecificDetails = `**Destination:** \`${intent.destination || "Address not provided"}\`\n`;
             }

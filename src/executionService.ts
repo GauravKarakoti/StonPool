@@ -1,5 +1,5 @@
 import { Address, beginCell, toNano, Cell } from '@ton/core';
-import { DEX } from '@ston-fi/sdk';
+import { DEX, pTON } from '@ston-fi/sdk';
 import { TonClient, JettonMaster } from '@ton/ton';
 import { resolveAsset } from './stonfiServices';
 
@@ -126,6 +126,55 @@ export function buildNativeTransferPayload(amount: number): { bocBase64: string,
     };
 }
 
+export function buildStonfiTonToJettonPayload(
+    daoWalletAddress: string,
+    targetRouterJettonWallet: string, // The Router's wallet for the token you WANT to buy
+    amountIn: number, // Amount of TON to swap
+    minAmountOut: number,
+    decimalsOut: number
+): { bocBase64: string, forwardTon: string } {
+    
+    const daoAddress = Address.parse(daoWalletAddress);
+    const targetWalletAddress = Address.parse(targetRouterJettonWallet);
+
+    // 1. Convert human amounts to blockchain nano-units
+    const offerUnits = Math.floor(amountIn * 1e9); // Native TON always has 9 decimals
+    const minAskUnits = Math.floor(minAmountOut * Math.pow(10, decimalsOut));
+
+    // 2. Build the DEX-Specific Forward Payload
+    // This tells the STON.fi router what to do once it receives the swapped pTON
+    const swapPayload = beginCell()
+        .storeUint(0x25938561, 32) // STON.fi V1 swap opcode
+        .storeAddress(targetWalletAddress) // The Router's token wallet for the token we WANT
+        .storeCoins(minAskUnits) // Slippage protection: Minimum tokens to receive
+        .storeAddress(daoAddress) // Receiver Address: Where to send the swapped tokens
+        .storeUint(0, 1) // No referral address
+        .endCell();
+
+    // 3. Build the pTON TON_TRANSFER Payload
+    // Sent directly to the STON.fi pTON contract along with the Native TON
+    const pTonTransferBody = beginCell()
+        .storeUint(0x01f3835d, 32) // pTON TON_TRANSFER (pt_swap) opcode
+        .storeUint(0, 64) // Query ID
+        .storeCoins(offerUnits) // Amount of TON to swap
+        .storeAddress(STONFI_V1_ROUTER) // Destination: STON.fi V1 Router
+        .storeAddress(daoAddress) // Refund destination (where pTON returns excess TON)
+        // NOTE: No custom_payload bit here! (Unlike standard Jetton transfers)
+        .storeCoins(toNano('0.2')) // Forward TON amount (pays for the STON.fi router's gas)
+        .storeBit(1) // Flag indicating our DEX payload is stored as a reference
+        .storeRef(swapPayload) // Attach the DEX swap instructions from Step 2
+        .endCell();
+
+    // 4. Return the Base64 representation
+    // CRITICAL: For Native TON swaps, the total forwardTon must equal the swap amount PLUS the gas limit.
+    const totalTonToForward = amountIn + 0.265; 
+
+    return {
+        bocBase64: pTonTransferBody.toBoc().toString('base64'),
+        forwardTon: totalTonToForward.toString() 
+    };
+}
+
 export async function getDynamicSwapPayload(
     client: TonClient,
     daoWalletAddress: string,
@@ -137,47 +186,101 @@ export async function getDynamicSwapPayload(
     const askAsset = await resolveAsset(tokenOutTicker);
     if (!offerAsset || !askAsset) throw new Error("Assets not found in STON.fi registry.");
 
-    const offerTokenAddr = Address.parse(offerAsset.address);
     const askTokenAddr = Address.parse(askAsset.address);
     const treasuryAddr = Address.parse(daoWalletAddress);
 
-    // ✅ ADD THIS CHECK: Prevent TVM crash when trying to run Jetton methods on Native TON
+    // ✅ NATIVE TON ROUTE HANDLING
     const isNativeTon = offerAsset.address === "EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c";
     
     if (isNativeTon) {
-        throw new Error(
-            "Native TON to Jetton swaps require a pTON (Proxy TON) payload. " + 
-            "The current payload builder only supports Jetton-to-Jetton swaps."
+        // Instantiate the pTON V1 contract from STON.fi SDK to get its mainnet address
+        const proxyTon = new pTON.v1();
+        const pTonAddress = proxyTon.address;
+        
+        // We still need the Router's wallet for the token we are asking for
+        const askMaster = client.open(JettonMaster.create(askTokenAddr));
+        const routerAskWallet = await askMaster.getWalletAddress(STONFI_V1_ROUTER);
+
+        const payload = buildStonfiTonToJettonPayload(
+            daoWalletAddress,
+            routerAskWallet.toString(),
+            amountIn,
+            (amountIn * 0.99), // Mock 1% slippage limit (replace with real quote data)
+            askAsset.decimals
         );
+
+        return {
+            targetAddress: pTonAddress.toString(), // Send Native TON directly to the pTON Contract
+            bocBase64: payload.bocBase64,
+            forwardTon: payload.forwardTon // This contains Swap Amount + Gas
+        };
     }
 
-    // This will now only execute for actual Jettons (like USDT -> DUREV)
+    // ✅ STANDARD JETTON TO JETTON ROUTE
+    const offerTokenAddr = Address.parse(offerAsset.address);
     const offerMaster = client.open(JettonMaster.create(offerTokenAddr));
     const treasuryJettonWallet = await offerMaster.getWalletAddress(treasuryAddr);
 
     const askMaster = client.open(JettonMaster.create(askTokenAddr));
     const routerAskWallet = await askMaster.getWalletAddress(STONFI_V1_ROUTER);
 
-    // 4. Generate the payload with real on-chain data
+    // Generate the payload with real on-chain data
     const payload = buildStonfiSwapPayload(
         daoWalletAddress,
         routerAskWallet.toString(),
         amountIn,
         offerAsset.decimals,
-        (amountIn * 0.99), // Mock 1% slippage limit
+        (amountIn * 0.99), // Mock 1% slippage limit (replace with real quote data)
         askAsset.decimals
     );
 
     return {
-        targetAddress: treasuryJettonWallet.toString(),
+        targetAddress: treasuryJettonWallet.toString(), // Send to Treasury's Jetton Wallet
         bocBase64: payload.bocBase64,
         forwardTon: payload.forwardTon
     };
 }
 
-/**
- * DYNAMIC SDK INTEGRATION: PROVIDE LP
- */
+export function buildStonfiTonProvideLpPayload(
+    daoWalletAddress: string,
+    routerPairedWallet: string, // The Router's wallet for the OTHER token in the pair
+    amountIn: number
+): { bocBase64: string, forwardTon: string } {
+    const daoAddress = Address.parse(daoWalletAddress);
+    const pairedWalletAddress = Address.parse(routerPairedWallet);
+    const offerUnits = Math.floor(amountIn * 1e9);
+
+    // 1. Build the DEX-Specific Provide LP Payload
+    // This tells the router what to do with the pTON once it receives it
+    const lpPayload = beginCell()
+        .storeUint(0x4f5f4313, 32) // STON.fi V2 provide_lp opcode
+        .storeAddress(pairedWalletAddress) // The Router's token wallet for the paired token
+        .storeCoins(1) // min_lp_out (simplified slippage protection)
+        .storeAddress(daoAddress) // Receiver Address: Where to send the LP tokens
+        .endCell();
+
+    // 2. Build the pTON TON_TRANSFER Payload
+    // Sent directly to the pTON contract along with the Native TON
+    const pTonTransferBody = beginCell()
+        .storeUint(0x01f3835d, 32) // pTON TON_TRANSFER (pt_swap / pt_transfer) opcode
+        .storeUint(0, 64) // Query ID
+        .storeCoins(offerUnits) // Amount of Native TON to wrap
+        .storeAddress(STONFI_V2_ROUTER) // Destination: STON.fi V2 Router
+        .storeAddress(daoAddress) // Refund destination
+        .storeCoins(toNano('0.3')) // Forward TON amount (pays for the router's gas)
+        .storeBit(1) // Flag indicating our DEX payload is stored as a reference
+        .storeRef(lpPayload) // Attach the DEX LP instructions from Step 1
+        .endCell();
+
+    // Total forward must cover the TON we are wrapping + the gas fee
+    const totalTonToForward = amountIn + 0.35; 
+
+    return {
+        bocBase64: pTonTransferBody.toBoc().toString('base64'),
+        forwardTon: totalTonToForward.toString() 
+    };
+}
+
 export async function getDynamicLpPayload(
     client: TonClient,
     daoWalletAddress: string,
@@ -187,17 +290,40 @@ export async function getDynamicLpPayload(
 ) {
     const offerAsset = await resolveAsset(tokenInTicker);
     const pairedAsset = await resolveAsset(pairedTokenTicker);
-    if (!offerAsset || !pairedAsset) throw new Error("Assets not found.");
+    if (!offerAsset || !pairedAsset) throw new Error("Assets not found in STON.fi registry.");
 
+    const NATIVE_TON_ADDRESS = "EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c";
+
+    if (offerAsset.address === NATIVE_TON_ADDRESS) {
+        // Instantiate the pTON V2.1 contract with its Mainnet address
+        const proxyTon = new pTON.v2_1("EQBnGWMCf3-FZZq1W4IWcWiGAc3PHuZ0_H-7sad2oY00o83S"); 
+        const pTonAddress = proxyTon.address;
+        
+        // We still need the Router's wallet for the Jetton it's being paired with
+        const pairedTokenAddr = Address.parse(pairedAsset.address);
+        const pairedMaster = client.open(JettonMaster.create(pairedTokenAddr));
+        const routerPairedWallet = await pairedMaster.getWalletAddress(STONFI_V2_ROUTER);
+
+        const payload = buildStonfiTonProvideLpPayload(
+            daoWalletAddress,
+            routerPairedWallet.toString(),
+            amountIn
+        );
+
+        return {
+            targetAddress: pTonAddress.toString(), // Send Native TON to pTON V2 Contract
+            bocBase64: payload.bocBase64,
+            forwardTon: payload.forwardTon
+        };
+    }
+
+    // ✅ ROUTE 2: STANDARD JETTON TO JETTON LP
     const offerTokenAddr = Address.parse(offerAsset.address);
     const pairedTokenAddr = Address.parse(pairedAsset.address);
     const treasuryAddr = Address.parse(daoWalletAddress);
 
     const offerMaster = client.open(JettonMaster.create(offerTokenAddr));
     const treasuryJettonWallet = await offerMaster.getWalletAddress(treasuryAddr);
-
-    // 2. Get STON.fi V2 Router's Jetton Wallets
-    // FIX: Ask the Jetton Masters where the V2 Router's wallets are!
     const routerOfferWallet = await offerMaster.getWalletAddress(STONFI_V2_ROUTER);
     
     const pairedMaster = client.open(JettonMaster.create(pairedTokenAddr));
@@ -212,7 +338,7 @@ export async function getDynamicLpPayload(
     );
 
     return {
-        targetAddress: treasuryJettonWallet.toString(),
+        targetAddress: treasuryJettonWallet.toString(), 
         bocBase64: payload.bocBase64,
         forwardTon: payload.forwardTon
     };
