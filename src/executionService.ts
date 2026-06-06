@@ -133,7 +133,6 @@ export async function getDynamicSwapPayload(
     tokenOutTicker: string,
     amountIn: number
 ) {
-    // 1. Fetch real master addresses and decimals from cache
     const offerAsset = await resolveAsset(tokenInTicker);
     const askAsset = await resolveAsset(tokenOutTicker);
     if (!offerAsset || !askAsset) throw new Error("Assets not found in STON.fi registry.");
@@ -142,11 +141,20 @@ export async function getDynamicSwapPayload(
     const askTokenAddr = Address.parse(askAsset.address);
     const treasuryAddr = Address.parse(daoWalletAddress);
 
+    // ✅ ADD THIS CHECK: Prevent TVM crash when trying to run Jetton methods on Native TON
+    const isNativeTon = offerAsset.address === "EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c";
+    
+    if (isNativeTon) {
+        throw new Error(
+            "Native TON to Jetton swaps require a pTON (Proxy TON) payload. " + 
+            "The current payload builder only supports Jetton-to-Jetton swaps."
+        );
+    }
+
+    // This will now only execute for actual Jettons (like USDT -> DUREV)
     const offerMaster = client.open(JettonMaster.create(offerTokenAddr));
     const treasuryJettonWallet = await offerMaster.getWalletAddress(treasuryAddr);
 
-    // 3. Get STON.fi V1 Router's specific Jetton Wallet for TokenOut
-    // FIX: Ask the TokenOut Jetton Master for the Router's wallet address!
     const askMaster = client.open(JettonMaster.create(askTokenAddr));
     const routerAskWallet = await askMaster.getWalletAddress(STONFI_V1_ROUTER);
 

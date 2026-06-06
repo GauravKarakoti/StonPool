@@ -3,7 +3,6 @@ import { mnemonicToPrivateKey } from '@ton/crypto';
 import { getHttpEndpoint } from '@orbs-network/ton-access';
 import { PrismaClient } from '@prisma/client';
 import { buildNativeTransferPayload, getDynamicLpPayload, getDynamicSwapPayload } from './executionService';
-import { getGroupTreasuryAddress } from './daoService';
 // Import your compiled Tact wrapper
 import { Treasury } from '../build/Treasury/Treasury_Treasury';
 import { Pool } from 'pg';
@@ -23,19 +22,11 @@ const prisma = new PrismaClient({ adapter });
 export async function startExecutionWorker() {
     console.log("⚙️ Starting StonPool Execution Worker...");
 
-    const endpoint = await getHttpEndpoint();
-    const client = new TonClient({ endpoint });
-
-    // 2. Derive the Bot's Master Keypair
+    // 1. Keep Keypair derivation OUTSIDE the loop (it doesn't need network)
     const mnemonic = process.env.BOT_MNEMONIC!.split(" ");
     const keyPair = await mnemonicToPrivateKey(mnemonic);
     
-    // 3. Initialize the Bot's Wallet Contract (V4 is the standard for modern TON wallets)
-    const wallet = WalletContractV4.create({ workchain: 0, publicKey: keyPair.publicKey });
-    const walletContract = client.open(wallet);
-    const sender = walletContract.sender(keyPair.secretKey);
-
-    // 4. The Polling Loop (Runs every 15 seconds)
+    // 2. The Polling Loop (Runs every 15 seconds)
     setInterval(async () => {
         try {
             // Fetch all proposals that hit quorum but haven't been executed
@@ -43,20 +34,38 @@ export async function startExecutionWorker() {
                 where: { status: 'PASSED' }
             });
 
+            // 🌟 ADD THIS: If there's nothing to do, just skip and don't hit the network
+            if (pendingProposals.length === 0) return; 
+
+            // 🌟 MOVE TON CLIENT SETUP HERE: 
+            // This guarantees we get a fresh, synced node from Orbs right before execution
+            const endpoint = await getHttpEndpoint();
+            const client = new TonClient({ endpoint });
+            
+            const wallet = WalletContractV4.create({ workchain: 0, publicKey: keyPair.publicKey });
+            const walletContract = client.open(wallet);
+            const sender = walletContract.sender(keyPair.secretKey);
+
             for (const p of pendingProposals) {
                 console.log(`🚀 Executing Proposal #${p.id}...`);
 
-                // ✨ INNER TRY/CATCH: Isolates failures to the specific proposal
                 try {
-                    // A. Lock the proposal immediately to prevent double-spending
+                    // A. Lock the proposal immediately
                     await prisma.proposal.update({
                         where: { id: p.id },
                         data: { status: 'EXECUTING' }
                     });
 
                     // B. Fetch the DAO's unique Treasury Address
-                    const treasuryAddressStr = await getGroupTreasuryAddress(Number(p.groupId));
-                    if (!treasuryAddressStr) throw new Error("Treasury not found for group");
+                    const treasuryRecord = await prisma.treasury.findUnique({
+                        where: { groupId: p.groupId }
+                    });
+                    
+                    if (!treasuryRecord || !treasuryRecord.contractAddress) {
+                        throw new Error("Treasury not found for group");
+                    }
+                    
+                    const treasuryAddressStr = treasuryRecord.contractAddress;
                     const treasuryAddress = Address.parse(treasuryAddressStr);
 
                     const treasury = client.open(Treasury.fromAddress(treasuryAddress));

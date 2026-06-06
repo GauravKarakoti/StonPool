@@ -1,4 +1,4 @@
-import { Bot, InlineKeyboard } from "grammY";
+import { Bot, GrammyError, HttpError, InlineKeyboard } from "grammY";
 import * as dotenv from "dotenv";
 import { processJoinDaoRequest, saveUserWallet, resolveJoinRequest, createProposal, castVote, getGroupTreasuryAddress } from "./src/daoService";
 import { parseProposalIntent } from "./src/aiService";
@@ -192,11 +192,11 @@ bot.on("callback_query:data", async (ctx) => {
         try {
             const chatMember = await ctx.api.getChatMember(targetGroupId, clickerId);
             if (!['administrator', 'creator'].includes(chatMember.status)) {
-                await ctx.answerCallbackQuery({ text: "⛔ You are no longer an Admin of this group!", show_alert: true });
+                await ctx.answerCallbackQuery({ text: "⛔ You are no longer an Admin of this group!", show_alert: true }).catch(err => console.warn("Could not answer callback (likely expired):", err.message));
                 return;
             }
         } catch (error) {
-            await ctx.answerCallbackQuery({ text: "⛔ Error verifying admin status. The bot might have been removed from the group.", show_alert: true });
+            await ctx.answerCallbackQuery({ text: "⛔ Error verifying admin status. The bot might have been removed from the group.", show_alert: true }).catch(err => console.warn("Could not answer callback (likely expired):", err.message));
             return;
         }
 
@@ -204,7 +204,7 @@ bot.on("callback_query:data", async (ctx) => {
         const success = await resolveJoinRequest(targetTgId, targetGroupId, action);
 
         if (success) {
-            await ctx.answerCallbackQuery({ text: `Request ${action === 'APPROVE' ? 'Approved' : 'Rejected'}!` });
+            await ctx.answerCallbackQuery({ text: `Request ${action === 'APPROVE' ? 'Approved' : 'Rejected'}!` }).catch(err => console.warn("Could not answer callback (likely expired):", err.message));
 
             // --- FETCH USER FOR MENTION ---
             let targetMention = `[User](tg://user?id=${targetTgId})`; // Fallback
@@ -238,7 +238,7 @@ bot.on("callback_query:data", async (ctx) => {
             }
 
         } else {
-            await ctx.answerCallbackQuery({ text: "❌ Database error occurred.", show_alert: true });
+            await ctx.answerCallbackQuery({ text: "❌ Database error occurred.", show_alert: true }).catch(err => console.warn("Could not answer callback (likely expired):", err.message));
         }
     }
 
@@ -255,12 +255,13 @@ bot.on("callback_query:data", async (ctx) => {
 
         // 2. Handle unauthorized clicks (Alert popup)
         if (!voteResult.success) {
-            await ctx.answerCallbackQuery({ text: voteResult.message!, show_alert: true });
+            await ctx.answerCallbackQuery({ text: voteResult.message!, show_alert: true }).catch(err => console.warn("Could not answer callback (likely expired):", err.message));
             return;
         }
 
-        // 3. Acknowledge the vote to the user
-        await ctx.answerCallbackQuery({ text: `✅ Vote recorded: ${support ? 'Approve' : 'Reject'}` });
+        await ctx.answerCallbackQuery({ 
+            text: `✅ Vote recorded: ${support ? 'Approve' : 'Reject'}` 
+        }).catch(err => console.warn("Could not answer callback (likely expired):", err.message));
 
         // 4. Rebuild the Live Dashboard UI
         const p = voteResult.proposal!;
@@ -335,6 +336,19 @@ bot.on("callback_query:data", async (ctx) => {
             await ctx.editMessageText(responseText, { parse_mode: "Markdown" });
         }
         return;
+    }
+});
+
+bot.catch((err) => {
+    const ctx = err.ctx;
+    console.error(`[Error] Update ${ctx.update.update_id} failed:`);
+    const e = err.error;
+    if (e instanceof GrammyError) {
+        console.error("Error in request:", e.description);
+    } else if (e instanceof HttpError) {
+        console.error("Could not contact Telegram:", e);
+    } else {
+        console.error("Unknown error:", e);
     }
 });
 
