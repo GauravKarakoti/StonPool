@@ -3,10 +3,11 @@
     "version": "0.0.1",
     "scripts": {
         "bp": "blueprint",
-        "start": "ts-node index.ts",
+        "start": "node dist/index.js",
         "start:contract": "blueprint run",
         "dev": "tsx watch index.ts",
-        "build": "CI=true blueprint build --all",
+        "build": "tsc",
+        "build:contract": "CI=true blueprint build --all",
         "test": "jest --verbose",
         "release": "blueprint pack && npm publish --access public",
         "db:gen": "prisma generate",
@@ -44,7 +45,6 @@
         "jest": "^30.0.5",
         "prettier": "^3.6.2",
         "ts-jest": "^29.4.1",
-        "ts-node": "^10.9.2",
         "typescript": "^5.9.3"
     }
 }
