@@ -20,7 +20,7 @@ const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
 
 export async function startExecutionWorker() {
-    console.log("⚙️ Starting StonPool Execution Worker...");
+    console.log("⚙️ Starting StonMaker Execution Worker...");
 
     // 1. Keep Keypair derivation OUTSIDE the loop (it doesn't need network)
     const mnemonic = process.env.BOT_MNEMONIC!.split(" ");

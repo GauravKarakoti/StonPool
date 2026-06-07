@@ -15,7 +15,7 @@ const bot = new Bot(process.env.BOT_TOKEN as string);
 const app = express();
 
 const HELP_MESSAGE = `
-🤖 **StonPool DAO Bot - Help Menu**
+🤖 **StonMaker DAO Bot - Help Menu**
 
 Here are the commands and actions you can use to interact with the DAO:
 
@@ -60,7 +60,7 @@ bot.on("message:text", async (ctx) => {
             }
 
             await ctx.reply(
-                `🏦 **StonPool Treasury Dashboard**\n\n` +
+                `🏦 **StonMaker Treasury Dashboard**\n\n` +
                 `**Group:** ${chat.title}\n` +
                 `**Treasury Address:** \`${treasuryAddress}\`\n\n` +
                 `_This is your counterfactual smart contract wallet. You can securely deposit TON and Jettons directly to this address._`,
@@ -147,7 +147,7 @@ bot.on("message:text", async (ctx) => {
             }
 
             let dexQuoteText = "";
-            const STONPOOL_FEE_TON = 0.1; // Your protocol & gas coverage fee
+            const STONMAKER_FEE_TON = 0.1; // Your protocol & gas coverage fee
 
             if (intent.action === "SWAP" && intent.tokenOut) {
                 const quote = await fetchSwapQuote(intent.tokenIn, intent.tokenOut, intent.amount);
@@ -185,7 +185,7 @@ bot.on("message:text", async (ctx) => {
                 `**Amount:** ${intent.amount} ${intent.tokenIn}\n` +
                 actionSpecificDetails +
                 `\n⚙️ **Network Costs:**\n` +
-                `• **StonPool Relayer Fee:** ${STONPOOL_FEE_TON} TON\n` + 
+                `• **StonMaker Relayer Fee:** ${STONMAKER_FEE_TON} TON\n` + 
                 `_(Deducted automatically from Treasury to cover gas and automation)_\n` +
                 `\n*AI Summary:* ${intent.explanation}\n\n` +
                 `🏁 *Voting is now OPEN. Quorum required: 60%*`;
@@ -390,7 +390,7 @@ bot.catch((err: any) => {
 
 bot.start({
     onStart: (botInfo: any) => {
-        console.log(`🚀 StonPool Bot (@${botInfo.username}) is running!`);
+        console.log(`🚀 StonMaker Bot (@${botInfo.username}) is running!`);
         startExecutionWorker(); // Ignite the background process
     },
 });

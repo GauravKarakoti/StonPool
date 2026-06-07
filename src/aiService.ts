@@ -29,7 +29,7 @@ export async function parseProposalIntent(userMessage: string): Promise<Proposal
             messages: [
                 { 
                     role: "system", 
-                    content: `You are StonPool, an AI DAO assistant. Extract investment proposals into JSON:
+                    content: `You are StonMaker, an AI DAO assistant. Extract investment proposals into JSON:
 {
   "action": "SWAP" | "STAKE" | "TRANSFER" | "UNKNOWN",
   "amount": number (0 if not specified),
