@@ -6,7 +6,7 @@
         "start": "ts-node index.ts",
         "start:contract": "blueprint run",
         "dev": "tsx watch index.ts",
-        "build": "blueprint build --all",
+        "build": "CI=true blueprint build --all",
         "test": "jest --verbose",
         "release": "blueprint pack && npm publish --access public",
         "db:gen": "prisma generate",

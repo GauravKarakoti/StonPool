@@ -4,7 +4,7 @@
     {
       "name": "Treasury",
       "path": "contracts/treasury.tact",
-      "output": "build\\Treasury",
+      "output": "build/Treasury",
       "options": {
         "debug": false,
         "external": false
