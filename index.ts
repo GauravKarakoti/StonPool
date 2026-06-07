@@ -14,6 +14,23 @@ dotenv.config();
 const bot = new Bot(process.env.BOT_TOKEN as string);
 const app = express();
 
+const HELP_MESSAGE = `
+🤖 **StonPool DAO Bot - Help Menu**
+
+Here are the commands and actions you can use to interact with the DAO:
+
+**Commands:**
+• \`/join_dao\` - Request to join the group's DAO. Admins will review your request.
+• \`/treasury\` - View the group's Treasury Dashboard and counterfactual smart contract wallet address.
+
+**Actions:**
+• **Propose an Investment:** Type \`propose <details>\` to create a new DeFi proposal. 
+  *Example:* \`propose SWAP 10 TON for USDT\`
+• **Link Wallet:** Reply directly to the bot's wallet request message with your 48-character TON Wallet Address to link it to your profile.
+
+*Note: Only approved DAO members can introduce or vote on investment proposals.*[cite: 1]
+`;
+
 bot.on("message:text", async (ctx) => {
     const text = ctx.message.text;
     const chatType = ctx.chat.type;
@@ -21,7 +38,10 @@ bot.on("message:text", async (ctx) => {
     const chat = ctx.chat;
 
     if (chatType === "group" || chatType === "supergroup") {
-        
+        if (text.startsWith("/help")) {
+            await ctx.reply(HELP_MESSAGE, { parse_mode: "Markdown" });
+        }
+
         if (text.startsWith("/join_dao")) {
             const loadingMsg = await ctx.reply("⏳ Processing your request...");
             const result = await processJoinDaoRequest(user.id, chat.id, user.username, user.first_name, chat.title);
