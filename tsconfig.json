@@ -12,6 +12,9 @@
         "node_modules",
         "dist",
         "build",
-        "tests"
+        "tests",
+        "frontend",
+        "scripts/deploymentService.ts",
+        "src/workerService.ts"
     ]
 }

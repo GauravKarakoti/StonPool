@@ -5,6 +5,13 @@ dist
 .DS_Store
 package.ts
 .env
+frontend/.env
+
+# Frontend build output
+frontend/dist
+frontend/.output
+frontend/.vinxi
+frontend/node_modules
 
 # VS Code
 .vscode/*

@@ -1,125 +1,632 @@
-import { Bot, GrammyError, HttpError, InlineKeyboard } from "grammy";
-import * as dotenv from "dotenv";
-import { processJoinDaoRequest, saveUserWallet, resolveJoinRequest, createProposal, castVote, getGroupTreasuryAddress } from "./src/daoService";
-import { parseProposalIntent } from "./src/aiService";
-import { fetchSwapQuote } from "./src/stonfiServices";
-import { buildNativeTransferPayload, getDynamicLpPayload, getDynamicSwapPayload } from "./src/executionService";
-import { startExecutionWorker } from "./src/workerService";
-import { getHttpEndpoint } from "@orbs-network/ton-access";
-import { TonClient } from "@ton/ton";
-import express from "express";
-
-dotenv.config();
+import 'dotenv/config';
+import { Bot, GrammyError, HttpError, InlineKeyboard, Keyboard } from 'grammy';
+import {
+    processJoinDaoRequest,
+    saveUserWallet,
+    resolveJoinRequest,
+    createProposal,
+    castVote,
+    getGroupTreasuryAddress,
+    getTreasuryBalance,
+    markAdminNotified,
+    shouldNotifyAdminsInGroup,
+    syncAdminRole,
+    syncAdminRolesForUserInKnownGroups,
+    saveProposalTelegramMessageId,
+    saveGroupInviteLink,
+    prisma,
+} from './src/daoService';
+import { parseProposalIntent, type ProposalIntent } from './src/aiService';
+import { startExecutionWorker } from './src/workerService';
+import { registerApiRoutes } from './src/apiRoutes';
+import { formatProposalMessage } from './src/formatters';
+import { parseDurationToHours, formatDurationFromHours } from './src/durationUtils';
+import { getTonNetworkLabel, formatExecutionNoticeHtml, formatExecutionLinksBlockHtml, type ExecutionNotice } from './src/tonNetwork';
+import { syncGroupTelegramMeta, syncAllKnownGroupsTelegramMeta } from './src/groupLookup';
+import express from 'express';
 
 const bot = new Bot(process.env.BOT_TOKEN as string);
 const app = express();
+const botUsername = process.env.BOT_USERNAME || '';
+
+const ADD_GROUP_REQUEST_ID = 42;
+
+const NO_ADMIN_RIGHTS = {
+    is_anonymous: false,
+    can_manage_chat: false,
+    can_delete_messages: false,
+    can_manage_video_chats: false,
+    can_restrict_members: false,
+    can_promote_members: false,
+    can_change_info: false,
+    can_invite_users: false,
+    can_post_stories: false,
+    can_edit_stories: false,
+    can_delete_stories: false,
+    can_post_messages: false,
+    can_edit_messages: false,
+    can_pin_messages: false,
+};
+
+/** Minimal admin rights so Telegram prompts to add the bot when a group is selected. */
+const BOT_ADD_RIGHTS = {
+    ...NO_ADMIN_RIGHTS,
+    can_manage_chat: true,
+};
+
+const USER_PICK_GROUP_RIGHTS = {
+    ...NO_ADMIN_RIGHTS,
+    can_manage_chat: true,
+    can_invite_users: true,
+};
+
+function createSelectGroupKeyboard(): Keyboard {
+    return new Keyboard()
+        .add({
+            text: '📋 Select your group',
+            request_chat: {
+                request_id: ADD_GROUP_REQUEST_ID,
+                chat_is_channel: false,
+                bot_is_member: false,
+                user_administrator_rights: USER_PICK_GROUP_RIGHTS,
+                bot_administrator_rights: BOT_ADD_RIGHTS,
+            },
+        })
+        .resized()
+        .oneTime();
+}
+
+const GROUP_WELCOME_MESSAGE =
+    '👋 <b>StonMaker is in your group.</b>\n\n' +
+    '• Members: <code>/join_dao</code>\n' +
+    '• Treasury: <code>/treasury</code>\n' +
+    '• Proposals: <code>/propose</code> (members only)\n' +
+    '• Help: <code>/help</code>';
+
+const PRIVATE_ADD_INSTRUCTIONS =
+    '<b>Add StonMaker to your Telegram group</b>\n\n' +
+    '1. Tap <b>Select your group</b> below\n' +
+    '2. Pick the group (you must be an admin)\n' +
+    '3. Tap <b>OK</b> when Telegram asks to add StonMaker\n\n' +
+    '<i>Telegram requires these steps — websites cannot add bots to a group automatically.</i>';
+
+/** Users awaiting a voting duration reply before proposal is created */
+const pendingProposalIntents = new Map<
+    string,
+    { rawText: string; intent: ProposalIntent; loadingMessageId?: number; chatId: number }
+>();
+
+function pendingKey(chatId: number, userId: number) {
+    return `${chatId}_${userId}`;
+}
 
 const HELP_MESSAGE = `
-🤖 **StonMaker DAO Bot - Help Menu**
+🤖 <b>StonMaker DAO Bot - Help Menu</b>
 
 Here are the commands and actions you can use to interact with the DAO:
 
-**Commands:**
-• \`/join_dao\` - Request to join the group's DAO. Admins will review your request.
-• \`/treasury\` - View the group's Treasury Dashboard and counterfactual smart contract wallet address.
+<b>Commands:</b>
+• <code>/join_dao</code> - Request to join the group's DAO. Admins will review your request.
+• <code>/treasury</code> - View the group's Treasury Dashboard and counterfactual smart contract wallet address.
+• <code>/balance</code> - Check the current TON balance of the group treasury.
+• <code>/dashboard</code> - Show how to find this group on the web dashboard.
+• <code>/set_invite &lt;link&gt;</code> - (Admins) Save the group invite link for dashboard search.
 
-**Actions:**
-• **Propose an Investment:** Type \`propose <details>\` to create a new DeFi proposal. 
-  *Example:* \`propose SWAP 10 TON for USDT\`
-• **Link Wallet:** Reply directly to the bot's wallet request message with your 48-character TON Wallet Address to link it to your profile.
+<b>Actions:</b>
+• <b>Propose an Investment:</b> Use <code>/propose &lt;details&gt;</code> to create a new DeFi proposal.
+  <i>Example:</i> <code>/propose SWAP 10 TON for USDT voting 24h</code>
+• <b>Link Wallet:</b> Reply directly to the bot's wallet request message with your 48-character TON Wallet Address to link it to your profile.
 
-*Note: Only approved DAO members can introduce or vote on investment proposals.*[cite: 1]
+<i>Note: Only approved DAO members can introduce or vote on investment proposals.</i>
 `;
 
-bot.on("message:text", async (ctx) => {
+async function notifyAdminsOnceInGroup(
+    ctx: { api: Bot['api']; chat: { id: number }; me: { username?: string } },
+    successfulDMs: number
+) {
+    if (successfulDMs > 0) return;
+    const shouldNotify = await shouldNotifyAdminsInGroup(ctx.chat.id);
+    if (!shouldNotify) return;
+
+    const username = botUsername || ctx.me.username || 'StonMakerBot';
+    await ctx.api.sendMessage(
+        ctx.chat.id,
+        `📬 <b>Admins</b> — to receive approval requests, please start a private chat with me first: t.me/${username}`,
+        { parse_mode: 'HTML' }
+    );
+    await markAdminNotified(ctx.chat.id);
+}
+
+async function syncGroupAdmins(chatId: number) {
+    try {
+        const admins = await bot.api.getChatAdministrators(chatId);
+        for (const admin of admins) {
+            if (admin.user.is_bot) continue;
+            await syncAdminRole(admin.user.id, chatId, true);
+        }
+    } catch (error) {
+        console.log('Could not sync group admins:', error);
+    }
+}
+
+async function isGroupAdmin(api: Bot['api'], chatId: number, userId: number): Promise<boolean> {
+    try {
+        const member = await api.getChatMember(chatId, userId);
+        return member.status === 'creator' || member.status === 'administrator';
+    } catch {
+        return false;
+    }
+}
+
+async function postProposalMessage(
+    chatId: number,
+    messageId: number,
+    proposal: {
+        id: number;
+        action: string;
+        amount: number;
+        tokenIn: string;
+        tokenOut?: string | null;
+        destination?: string | null;
+        expiresAt?: Date | null;
+    },
+    proposer: { username?: string | null; firstName?: string | null },
+    voteStats: { yesVotes: number; noVotes: number; requiredQuorum: number; totalEligible: number },
+    concluded?: boolean,
+    conclusionStatus?: string
+) {
+    const text = formatProposalMessage(proposal, proposer, {
+        ...voteStats,
+        concluded,
+        conclusionStatus,
+    });
+
+    const votingKeyboard = new InlineKeyboard()
+        .text(`👍 Approve (${voteStats.yesVotes})`, `v_yes_${proposal.id}`)
+        .text(`👎 Reject (${voteStats.noVotes})`, `v_no_${proposal.id}`);
+
+    await bot.api.editMessageText(chatId, messageId, text, {
+        parse_mode: 'HTML',
+        reply_markup: concluded ? undefined : votingKeyboard,
+    });
+}
+
+async function notifyProposalExecuted(notice: ExecutionNotice) {
+    const proposal = await prisma.proposal.findUnique({
+        where: { id: notice.proposalId },
+        include: {
+            proposer: true,
+            votes: true,
+            group: { include: { treasury: true } },
+        },
+    });
+    if (!proposal) return;
+
+    const totalMembers = await prisma.groupMember.count({
+        where: { groupId: proposal.groupId, joinStatus: 'APPROVED' },
+    });
+    const quorumThreshold = proposal.group.treasury?.quorumThreshold ?? 60;
+    const yesVotes = proposal.votes.filter((v) => v.support).length;
+    const noVotes = proposal.votes.filter((v) => !v.support).length;
+    const requiredQuorum = Math.ceil(totalMembers * (quorumThreshold / 100));
+    const executionLinks = formatExecutionLinksBlockHtml(notice);
+
+    if (proposal.telegramMessageId) {
+        const text = formatProposalMessage(proposal, proposal.proposer, {
+            yesVotes,
+            noVotes,
+            requiredQuorum,
+            totalEligible: totalMembers,
+            concluded: true,
+            conclusionStatus: 'EXECUTED',
+            executionLinks,
+        });
+        await bot.api.editMessageText(notice.chatId, proposal.telegramMessageId, text, {
+            parse_mode: 'HTML',
+        });
+        console.log(`📣 Updated proposal #${notice.proposalId} message in Telegram with explorer links`);
+        return;
+    }
+
+    await bot.api.sendMessage(notice.chatId, formatExecutionNoticeHtml(notice), {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+    });
+    console.log(`📣 Posted execution notice for proposal #${notice.proposalId} in Telegram`);
+}
+
+async function sendPrivateAddToGroupPrompt(ctx: { reply: (text: string, opts?: object) => Promise<unknown> }) {
+    await ctx.reply(PRIVATE_ADD_INSTRUCTIONS, {
+        parse_mode: 'HTML',
+        reply_markup: createSelectGroupKeyboard(),
+    });
+}
+
+bot.command('start', async (ctx) => {
+    if (!ctx.from) return;
+
+    if (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') {
+        await syncGroupAdmins(ctx.chat.id);
+        await syncGroupTelegramMeta(ctx.api, ctx.chat.id);
+        await ctx.reply(GROUP_WELCOME_MESSAGE, { parse_mode: 'HTML' });
+        return;
+    }
+
+    if (ctx.chat.type === 'private') {
+        const userId = ctx.from.id;
+        await syncAdminRolesForUserInKnownGroups(userId, async (chatTgId) => {
+            try {
+                const member = await ctx.api.getChatMember(chatTgId, userId);
+                return ['administrator', 'creator'].includes(member.status);
+            } catch {
+                return false;
+            }
+        });
+        await sendPrivateAddToGroupPrompt(ctx);
+    }
+});
+
+bot.command('add', async (ctx) => {
+    if (!ctx.from || ctx.chat.type !== 'private') return;
+    await sendPrivateAddToGroupPrompt(ctx);
+});
+
+bot.on('message', async (ctx, next) => {
+    const shared = ctx.message?.chat_shared;
+    if (!shared || ctx.chat?.type !== 'private' || shared.request_id !== ADD_GROUP_REQUEST_ID) {
+        await next();
+        return;
+    }
+
+    const groupChatId = shared.chat_id;
+
+    try {
+        const botMember = await ctx.api.getChatMember(groupChatId, ctx.me.id);
+        if (botMember.status === 'left' || botMember.status === 'kicked') {
+            await ctx.reply(
+                'StonMaker was not added. Tap <b>Select your group</b> again and confirm when Telegram asks to add the bot.',
+                { parse_mode: 'HTML', reply_markup: createSelectGroupKeyboard() }
+            );
+            return;
+        }
+
+        const chat = await ctx.api.getChat(groupChatId);
+        const title = 'title' in chat ? chat.title : 'your group';
+
+        await ctx.reply(
+            `✅ StonMaker is in <b>${title}</b>.\n\nOpen that group and run <code>/join_dao</code> to get started.`,
+            { parse_mode: 'HTML', reply_markup: { remove_keyboard: true } }
+        );
+    } catch (error) {
+        console.error('chat_shared handler error:', error);
+        await ctx.reply('Could not verify that group. Make sure you are an admin, then try again.', {
+            reply_markup: createSelectGroupKeyboard(),
+        });
+    }
+});
+
+bot.on('my_chat_member', async (ctx) => {
+    const { new_chat_member, old_chat_member, chat } = ctx.myChatMember;
+    if (chat.type !== 'group' && chat.type !== 'supergroup') return;
+
+    const wasOutside = ['left', 'kicked'].includes(old_chat_member.status);
+    const nowInside = new_chat_member.status === 'member' || new_chat_member.status === 'administrator';
+
+    if (!wasOutside || !nowInside) return;
+
+    await syncGroupAdmins(chat.id);
+    await syncGroupTelegramMeta(ctx.api, chat.id);
+
+    try {
+        await bot.api.sendMessage(chat.id, GROUP_WELCOME_MESSAGE, { parse_mode: 'HTML' });
+    } catch (error) {
+        console.log('Could not post group welcome after bot was added:', error);
+    }
+});
+
+async function handleProposalFlow(
+    chatId: number,
+    userId: number,
+    username: string | undefined,
+    firstName: string | undefined,
+    proposalText: string,
+    replyFn: (text: string, opts?: object) => Promise<{ message_id: number }>,
+    editFn: (messageId: number, text: string, opts?: object) => Promise<unknown>
+) {
+    const loadingMsg = await replyFn('🧠 <i>Analyzing your proposal...</i>', { parse_mode: 'HTML' });
+
+    const intent = await parseProposalIntent(proposalText);
+
+    if (!intent || intent.action === 'UNKNOWN') {
+        await editFn(
+            loadingMsg.message_id,
+            '❌ I couldn\'t clearly understand the DeFi parameters in your proposal. Please rephrase with specific tokens and amounts.'
+        );
+        return;
+    }
+
+    let expiresAt: Date | undefined;
+    if (intent.votingDurationHours && intent.votingDurationHours > 0) {
+        expiresAt = new Date(Date.now() + intent.votingDurationHours * 60 * 60 * 1000);
+    }
+
+    if (!expiresAt) {
+        pendingProposalIntents.set(pendingKey(chatId, userId), {
+            rawText: proposalText,
+            intent,
+            loadingMessageId: loadingMsg.message_id,
+            chatId,
+        });
+
+        await editFn(
+            loadingMsg.message_id,
+            '⏳ <b>How long should voting stay open?</b>\n\n<b>Reply to this message</b> with a duration e.g. <code>24h</code>, <code>2d</code>, or <code>1w</code>.',
+            { parse_mode: 'HTML' }
+        );
+        return;
+    }
+
+    const dbResult = await createProposal(chatId, userId, proposalText, intent, expiresAt);
+
+    if (!dbResult.success || !dbResult.proposal) {
+        await editFn(loadingMsg.message_id, dbResult.message!);
+        return;
+    }
+
+    const text = formatProposalMessage(dbResult.proposal, dbResult.proposal.proposer, {
+        yesVotes: 0,
+        noVotes: 0,
+        requiredQuorum: dbResult.requiredQuorum!,
+        totalEligible: dbResult.totalEligible!,
+    });
+
+    const votingKeyboard = new InlineKeyboard()
+        .text('👍 Approve (0)', `v_yes_${dbResult.proposal.id}`)
+        .text('👎 Reject (0)', `v_no_${dbResult.proposal.id}`);
+
+    await editFn(loadingMsg.message_id, text, { parse_mode: 'HTML', reply_markup: votingKeyboard });
+    await saveProposalTelegramMessageId(dbResult.proposal.id, loadingMsg.message_id);
+}
+
+bot.on('message:text', async (ctx) => {
     const text = ctx.message.text;
     const chatType = ctx.chat.type;
     const user = ctx.from;
     const chat = ctx.chat;
 
-    if (chatType === "group" || chatType === "supergroup") {
-        if (text.startsWith("/help")) {
-            await ctx.reply(HELP_MESSAGE, { parse_mode: "Markdown" });
+    if (chatType === 'group' || chatType === 'supergroup') {
+        const inviteMatch = text.match(/(https?:\/\/)?t\.me\/\+[A-Za-z0-9_-]+/i);
+        if (inviteMatch && (await isGroupAdmin(ctx.api, chat.id, user.id))) {
+            const normalized = inviteMatch[0].startsWith('http') ? inviteMatch[0] : `https://${inviteMatch[0]}`;
+            await saveGroupInviteLink(chat.id, normalized);
         }
 
-        if (text.startsWith("/join_dao")) {
-            const loadingMsg = await ctx.reply("⏳ Processing your request...");
-            const result = await processJoinDaoRequest(user.id, chat.id, user.username, user.first_name, chat.title);
-            
-            await ctx.api.editMessageText(chat.id, loadingMsg.message_id, result.message, { parse_mode: "Markdown" });
+        const pending = pendingProposalIntents.get(pendingKey(chat.id, user.id));
+        if (pending && !text.startsWith('/') && !text.toLowerCase().startsWith('propose ')) {
+            const isReplyToBot = ctx.message.reply_to_message?.from?.id === ctx.me.id;
+            if (!isReplyToBot) {
+                await ctx.reply(
+                    '⏳ Please <b>reply to my duration question</b> with e.g. <code>24h</code>, <code>2d</code>, or <code>1w</code>.',
+                    { parse_mode: 'HTML', reply_to_message_id: pending.loadingMessageId }
+                );
+                return;
+            }
+            const hours = parseDurationToHours(text);
+            if (!hours) {
+                await ctx.reply(
+                    '❌ Invalid duration. Reply with a duration like <code>24h</code>, <code>2d</code>, or <code>1w</code>.',
+                    { parse_mode: 'HTML' }
+                );
+                return;
+            }
+
+            const expiresAt = new Date(Date.now() + hours * 60 * 60 * 1000);
+            const dbResult = await createProposal(chat.id, user.id, pending.rawText, pending.intent, expiresAt);
+            pendingProposalIntents.delete(pendingKey(chat.id, user.id));
+
+            if (!dbResult.success || !dbResult.proposal) {
+                if (pending.loadingMessageId) {
+                    await ctx.api.editMessageText(chat.id, pending.loadingMessageId, dbResult.message || '❌ Failed to create proposal.');
+                } else {
+                    await ctx.reply(dbResult.message || '❌ Failed to create proposal.');
+                }
+                return;
+            }
+
+            const durationLabel = formatDurationFromHours(hours);
+            await postProposalMessage(
+                chat.id,
+                pending.loadingMessageId!,
+                dbResult.proposal,
+                dbResult.proposal.proposer,
+                {
+                    yesVotes: 0,
+                    noVotes: 0,
+                    requiredQuorum: dbResult.requiredQuorum!,
+                    totalEligible: dbResult.totalEligible!,
+                }
+            );
+            await saveProposalTelegramMessageId(dbResult.proposal.id, pending.loadingMessageId!);
+            await ctx.reply(`⏳ Voting closes in ${durationLabel}.`, { parse_mode: 'HTML' });
             return;
         }
 
-        // --- TREASURY DASHBOARD COMMAND ---
-        if (text.startsWith("/treasury")) {
+        if (text.startsWith('/help')) {
+            await ctx.reply(HELP_MESSAGE, { parse_mode: 'HTML' });
+            return;
+        }
+
+        if (text.startsWith('/join_dao')) {
+            const loadingMsg = await ctx.reply('⏳ Processing your request...');
+            const result = await processJoinDaoRequest(user.id, chat.id, user.username, user.first_name, chat.title);
+            await syncGroupTelegramMeta(ctx.api, chat.id);
+            await ctx.api.editMessageText(chat.id, loadingMsg.message_id, result.message, { parse_mode: 'Markdown' });
+            return;
+        }
+
+        if (text.startsWith('/treasury')) {
             const treasuryAddress = await getGroupTreasuryAddress(chat.id);
 
             if (!treasuryAddress) {
-                await ctx.reply("❌ This group hasn't been initialized as a DAO yet. Have a member type `/join_dao` to generate the Treasury.", { parse_mode: "Markdown" });
+                await ctx.reply(
+                    '❌ This group hasn\'t been initialized as a DAO yet. Have a member type <code>/join_dao</code> to generate the Treasury.',
+                    { parse_mode: 'HTML' }
+                );
                 return;
             }
 
             await ctx.reply(
-                `🏦 **StonMaker Treasury Dashboard**\n\n` +
-                `**Group:** ${chat.title}\n` +
-                `**Treasury Address:** \`${treasuryAddress}\`\n\n` +
-                `_This is your counterfactual smart contract wallet. You can securely deposit TON and Jettons directly to this address._`,
-                { parse_mode: "Markdown" }
+                `🏦 <b>StonMaker Treasury Dashboard</b>\n\n` +
+                    `<b>Group:</b> ${chat.title}\n` +
+                    `<b>Treasury Address:</b> <code>${treasuryAddress}</code>\n\n` +
+                    `<i>This is your counterfactual smart contract wallet. You can securely deposit TON and Jettons directly to this address.</i>`,
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        if (text.startsWith('/balance')) {
+            const treasury = await getTreasuryBalance(chat.id);
+
+            if (!treasury) {
+                await ctx.reply(
+                    '❌ This group hasn\'t been initialized as a DAO yet. Have a member type <code>/join_dao</code> to generate the Treasury.',
+                    { parse_mode: 'HTML' }
+                );
+                return;
+            }
+
+            if (treasury.balanceTon < 0) {
+                await ctx.reply(
+                    `⚠️ Could not fetch balance right now.\n\n<b>Treasury Address:</b> <code>${treasury.address}</code>`,
+                    { parse_mode: 'HTML' }
+                );
+                return;
+            }
+
+            if (treasury.balanceTon === 0) {
+                await ctx.reply(
+                    `🏦 Treasury not yet deployed — address is <code>${treasury.address}</code>. Send TON to activate it.`,
+                    { parse_mode: 'HTML' }
+                );
+                return;
+            }
+
+            await ctx.reply(`🏦 <b>Treasury Balance:</b> ${treasury.balanceTon.toFixed(4)} TON`, { parse_mode: 'HTML' });
+            return;
+        }
+
+        if (text.startsWith('/dashboard')) {
+            await ctx.reply(
+                `📊 <b>Dashboard lookup</b>\n\n` +
+                    `<b>Group:</b> ${chat.title}\n` +
+                    `<b>Chat ID:</b> <code>${chat.id}</code>\n\n` +
+                    `On the web dashboard, search using:\n` +
+                    `• This chat ID\n` +
+                    `• Group name: <code>${chat.title}</code>\n` +
+                    `• Invite link — admins run <code>/set_invite https://t.me/+...</code> once`,
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+
+        if (text.startsWith('/set_invite')) {
+            if (!(await isGroupAdmin(ctx.api, chat.id, user.id))) {
+                await ctx.reply('Only group admins can register the invite link.');
+                return;
+            }
+
+            const linkArg = text.replace(/^\/set_invite(@\S+)?\s*/i, '').trim();
+            const linkMatch = linkArg.match(/(?:https?:\/\/)?t\.me\/\+[A-Za-z0-9_-]+/i);
+            if (!linkMatch) {
+                await ctx.reply(
+                    'Usage: <code>/set_invite https://t.me/+YourInviteHash</code>',
+                    { parse_mode: 'HTML' }
+                );
+                return;
+            }
+
+            const normalized = linkMatch[0].startsWith('http') ? linkMatch[0] : `https://${linkMatch[0]}`;
+            await saveGroupInviteLink(chat.id, normalized);
+            await ctx.reply('✅ Invite link saved. You can now paste it into the web dashboard search.', {
+                parse_mode: 'HTML',
+            });
+            return;
+        }
+
+        if (text.startsWith('/propose')) {
+            const details = text.replace(/^\/propose(@\S+)?\s*/i, '').trim();
+            if (!details) {
+                await ctx.reply(
+                    'Usage: <code>/propose SWAP 10 TON for USDT voting 24h</code>\n\n<i>You must be an approved DAO member to create proposals.</i>',
+                    { parse_mode: 'HTML' }
+                );
+                return;
+            }
+
+            await handleProposalFlow(
+                chat.id,
+                user.id,
+                user.username,
+                user.first_name,
+                `propose ${details}`,
+                (t, opts) => ctx.reply(t, opts as any),
+                (id, t, opts) => ctx.api.editMessageText(chat.id, id, t, opts as any)
             );
             return;
         }
 
         if (ctx.message.reply_to_message?.from?.id === ctx.me.id) {
             const replyText = ctx.message.reply_to_message.text;
-            
-            if (replyText?.includes("reply to this message with your TON Wallet Address")) {
+
+            if (replyText?.includes('reply to this message with your TON Wallet Address')) {
                 const walletAddress = text.trim();
-                
+
                 if (walletAddress.length === 48) {
-                    // 1. Save wallet to DB
-                    await saveUserWallet(user.id, walletAddress);
+                    await saveUserWallet(user.id, chat.id, walletAddress);
 
-                    // 2. Fetch all administrators of the current group
                     const admins = await ctx.api.getChatAdministrators(chat.id);
-                    
-                    // 3. Create a compact payload: app_{userId}_{groupId}
-                    // Telegram has a 64-byte limit on callback_data, so we use abbreviations.
-                    const keyboard = new InlineKeyboard()
-                        .text("✅ Approve", `app_${user.id}_${chat.id}`)
-                        .text("❌ Reject", `rej_${user.id}_${chat.id}`);
 
-                    const adminMessage = 
-                        `🔔 **New DAO Membership Request**\n\n` +
-                        `**Group:** ${chat.title}\n` +
-                        `**User:** @${user.username || user.first_name}\n` +
-                        `**Wallet:** \`${walletAddress}\`\n\n` +
+                    const keyboard = new InlineKeyboard()
+                        .text('✅ Approve', `app_${user.id}_${chat.id}`)
+                        .text('❌ Reject', `rej_${user.id}_${chat.id}`);
+
+                    const adminMessage =
+                        `🔔 <b>New DAO Membership Request</b>\n\n` +
+                        `<b>Group:</b> ${chat.title}\n` +
+                        `<b>User:</b> @${user.username || user.first_name}\n` +
+                        `<b>Wallet:</b> <code>${walletAddress}</code>\n\n` +
                         `Please approve or reject:`;
 
                     let successfulDMs = 0;
 
-                    // 4. Loop through admins and DM them
                     for (const admin of admins) {
-                        if (admin.user.is_bot) continue; // Don't DM other bots
-                        
+                        if (admin.user.is_bot) continue;
+
                         try {
                             await ctx.api.sendMessage(admin.user.id, adminMessage, {
-                                parse_mode: "Markdown",
-                                reply_markup: keyboard
+                                parse_mode: 'HTML',
+                                reply_markup: keyboard,
                             });
                             successfulDMs++;
                         } catch (error) {
-                            // This triggers if the admin hasn't started a chat with the bot yet
                             console.log(`Failed to DM Admin ${admin.user.id}. They need to /start the bot.`);
                         }
                     }
 
-                    // 5. Provide feedback in the group
-                    if (successfulDMs > 0) {
-                        await ctx.reply(`✅ Wallet \`${walletAddress}\` linked. An approval request has been sent to the Admins' DMs!`, { parse_mode: "Markdown" });
-                    } else {
-                        await ctx.reply(`⚠️ Wallet linked, but I couldn't DM the Admins. \n\n**Admins:** You must send a private message to @${ctx.me.username} first so I can send you approval requests!`, { parse_mode: "Markdown" });
-                    }
+                    await notifyAdminsOnceInGroup(ctx, successfulDMs);
 
+                    if (successfulDMs > 0) {
+                        await ctx.reply(
+                            `✅ Wallet <code>${walletAddress}</code> linked. An approval request has been sent to the Admins' DMs!`,
+                            { parse_mode: 'HTML' }
+                        );
+                    } else {
+                        await ctx.reply(
+                            `⚠️ Wallet linked, but I couldn't DM the Admins.\n\n<b>Admins:</b> You must send a private message to @${ctx.me.username} first so I can send you approval requests!`,
+                            { parse_mode: 'HTML' }
+                        );
+                    }
                 } else {
                     await ctx.reply("❌ That doesn't look like a valid TON wallet address. Please try again.");
                 }
@@ -127,160 +634,102 @@ bot.on("message:text", async (ctx) => {
             }
         }
 
-        if (text.toLowerCase().startsWith("propose ")) {
-            
-            const loadingMsg = await ctx.reply("🧠 *Analyzing your proposal...*", { parse_mode: "Markdown" });
-            
-            // 1. Parse text using Groq
-            const intent = await parseProposalIntent(text);
-            
-            if (!intent || intent.action === "UNKNOWN") {
-                await ctx.api.editMessageText(chat.id, loadingMsg.message_id, "❌ I couldn't clearly understand the DeFi parameters in your proposal. Please rephrase with specific tokens and amounts.");
-                return;
-            }
-            
-            const dbResult = await createProposal(chat.id, user.id, text, intent);
-
-            if (!dbResult.success) {
-                await ctx.api.editMessageText(chat.id, loadingMsg.message_id, dbResult.message!);
-                return;
-            }
-
-            let dexQuoteText = "";
-            const STONMAKER_FEE_TON = 0.1; // Your protocol & gas coverage fee
-
-            if (intent.action === "SWAP" && intent.tokenOut) {
-                const quote = await fetchSwapQuote(intent.tokenIn, intent.tokenOut, intent.amount);
-                
-                if (quote.success) {
-                    dexQuoteText = 
-                        `\n📈 **Live Market Data:**\n` +
-                        `• **Expected:** ${quote.expectedOutput} ${intent.tokenOut}\n` +
-                        `• **Rate:** 1 ${intent.tokenIn} = ${quote.swapRate} ${intent.tokenOut}\n` +
-                        `• **LP Fee:** ${quote.fee} ${intent.tokenIn}\n`;
-                } else {
-                    dexQuoteText = `\n⚠️ *${quote.message}*\n`;
-                }
-            }
-
-            // 3. Build the In-Chat Voting Interface
-            const votingKeyboard = new InlineKeyboard()
-                .text("👍 Approve", `v_yes_${dbResult.proposalId}`)
-                .text("👎 Reject", `v_no_${dbResult.proposalId}`);
-            
-            let actionSpecificDetails = "";
-            
-            if (intent.action === "SWAP") {
-                actionSpecificDetails = (intent.tokenOut ? `**Target Asset:** ${intent.tokenOut}\n` : "") + dexQuoteText;
-            } else if (intent.action === "STAKE") {
-                actionSpecificDetails = `**Protocol:** ${intent.platform || "STON.fi"}\n**Expected Yield:** ~4.5% APY\n`;
-            } else if (intent.action === "TRANSFER") {
-                actionSpecificDetails = `**Destination:** \`${intent.destination || "Address not provided"}\`\n`;
-            }
-
-            const responseText = 
-                `📋 **Proposal #${dbResult.proposalId}**\n\n` +
-                `**Proposer:** @${user.username || user.first_name}\n` +
-                `**Action:** ${intent.action}\n` +
-                `**Amount:** ${intent.amount} ${intent.tokenIn}\n` +
-                actionSpecificDetails +
-                `\n⚙️ **Network Costs:**\n` +
-                `• **StonMaker Relayer Fee:** ${STONMAKER_FEE_TON} TON\n` + 
-                `_(Deducted automatically from Treasury to cover gas and automation)_\n` +
-                `\n*AI Summary:* ${intent.explanation}\n\n` +
-                `🏁 *Voting is now OPEN. Quorum required: 60%*`;
-                                 
-            await ctx.api.editMessageText(chat.id, loadingMsg.message_id, responseText, { 
-                parse_mode: "Markdown",
-                reply_markup: votingKeyboard
-            });
+        if (text.toLowerCase().startsWith('propose ')) {
+            await handleProposalFlow(
+                chat.id,
+                user.id,
+                user.username,
+                user.first_name,
+                text,
+                (t, opts) => ctx.reply(t, opts as any),
+                (id, t, opts) => ctx.api.editMessageText(chat.id, id, t, opts as any)
+            );
             return;
         }
     }
 });
 
-bot.on("message:new_chat_members", async (ctx) => {
-  const newMembers = ctx.message.new_chat_members;
+bot.on('message:new_chat_members', async (ctx) => {
+    const newMembers = ctx.message.new_chat_members;
 
-  for (const member of newMembers) {
-    // Optional: Prevent the bot from welcoming other bots
-    if (member.is_bot) continue;
+    for (const member of newMembers) {
+        if (member.is_bot) continue;
 
-    const userName = member.username ? `@${member.username}` : member.first_name;
-    
-    const welcomeMessage = `Welcome to the group, ${userName}! 🎉\n\nIf you want to be a part of the DAO, you can use the /join_dao command.`;
-
-    // Send the welcome message to the group
-    await ctx.reply(welcomeMessage);
-  }
+        const userName = member.username ? `@${member.username}` : member.first_name;
+        const welcomeMessage = `Welcome to the group, ${userName}! 🎉\n\nIf you want to be a part of the DAO, you can use the /join_dao command.`;
+        await ctx.reply(welcomeMessage);
+    }
 });
 
-bot.on("callback_query:data", async (ctx) => {
+bot.on('callback_query:data', async (ctx) => {
     const data = ctx.callbackQuery.data;
     const clickerId = ctx.from.id;
 
-    if (data.startsWith("app_") || data.startsWith("rej_")) {
-        // Parse the compact payload: app_{userId}_{groupId}
+    if (data.startsWith('app_') || data.startsWith('rej_')) {
         const parts = data.split('_');
         const action = parts[0] === 'app' ? 'APPROVE' : 'REJECT';
         const targetTgId = parseInt(parts[1]!, 10);
-        const targetGroupId = Number(parts[2]!); // Use Number() to safely handle large negative BigInt group IDs
+        const targetGroupId = Number(parts[2]!);
 
-        // 1. Verify the clicker is still an Admin of that specific group
         try {
             const chatMember = await ctx.api.getChatMember(targetGroupId, clickerId);
             if (!['administrator', 'creator'].includes(chatMember.status)) {
-                await ctx.answerCallbackQuery({ text: "⛔ You are no longer an Admin of this group!", show_alert: true }).catch((err: any) => console.warn("Could not answer callback (likely expired):", err.message));
+                await ctx
+                    .answerCallbackQuery({ text: '⛔ You are no longer an Admin of this group!', show_alert: true })
+                    .catch((err: any) => console.warn('Could not answer callback (likely expired):', err.message));
                 return;
             }
+            await syncAdminRole(clickerId, targetGroupId, true);
         } catch (error) {
-            await ctx.answerCallbackQuery({ text: "⛔ Error verifying admin status. The bot might have been removed from the group.", show_alert: true }).catch((err: any) => console.warn("Could not answer callback (likely expired):", err.message));
+            await ctx
+                .answerCallbackQuery({
+                    text: '⛔ Error verifying admin status. The bot might have been removed from the group.',
+                    show_alert: true,
+                })
+                .catch((err: any) => console.warn('Could not answer callback (likely expired):', err.message));
             return;
         }
 
-        // 2. Update the Database using the extracted Group ID
         const success = await resolveJoinRequest(targetTgId, targetGroupId, action);
 
         if (success) {
-            await ctx.answerCallbackQuery({ text: `Request ${action === 'APPROVE' ? 'Approved' : 'Rejected'}!` }).catch((err: any) => console.warn("Could not answer callback (likely expired):", err.message));
+            await ctx
+                .answerCallbackQuery({ text: `Request ${action === 'APPROVE' ? 'Approved' : 'Rejected'}!` })
+                .catch((err: any) => console.warn('Could not answer callback (likely expired):', err.message));
 
-            // --- FETCH USER FOR MENTION ---
-            let targetMention = `[User](tg://user?id=${targetTgId})`; // Fallback
+            let targetMention = `[User](tg://user?id=${targetTgId})`;
             try {
                 const member = await ctx.api.getChatMember(targetGroupId, targetTgId);
-                // If they have a username, tag it. Otherwise, create a text link to their profile.
-                targetMention = member.user.username 
-                    ? `@${member.user.username}` 
+                targetMention = member.user.username
+                    ? `@${member.user.username}`
                     : `[${member.user.first_name}](tg://user?id=${targetTgId})`;
             } catch (error) {
-                console.log("Could not fetch user for mention.");
+                console.log('Could not fetch user for mention.');
             }
 
-            // 3. Edit the DM message so the buttons disappear (now using their name!)
             const statusIcon = action === 'APPROVE' ? '✅' : '❌';
             await ctx.editMessageText(
-                `🔔 **DAO Membership Resolved** ${statusIcon}\n\n` +
-                `The request for ${targetMention} was **${action}D** by you.`,
-                { parse_mode: "Markdown" }
+                `🔔 <b>DAO Membership Resolved</b> ${statusIcon}\n\nThe request for ${targetMention} was <b>${action}D</b> by you.`,
+                { parse_mode: 'HTML' }
             );
 
-            // 4. Send a silent notification back to the main group with the proper tag
             try {
                 await ctx.api.sendMessage(
-                    targetGroupId, 
-                    `📢 DAO update: A membership request for ${targetMention} was **${action}D** by an admin.`,
-                    { parse_mode: "Markdown", disable_notification: true }
+                    targetGroupId,
+                    `📢 DAO update: A membership request for ${targetMention} was <b>${action}D</b> by an admin.`,
+                    { parse_mode: 'HTML', disable_notification: true }
                 );
             } catch (error) {
-                console.log("Could not send update to group.");
+                console.log('Could not send update to group.');
             }
-
         } else {
-            await ctx.answerCallbackQuery({ text: "❌ Database error occurred.", show_alert: true }).catch((err: any) => console.warn("Could not answer callback (likely expired):", err.message));
+            await ctx
+                .answerCallbackQuery({ text: '❌ Database error occurred.', show_alert: true })
+                .catch((err: any) => console.warn('Could not answer callback (likely expired):', err.message));
         }
     }
 
-    if (data.startsWith("v_yes_") || data.startsWith("v_no_")) {
+    if (data.startsWith('v_yes_') || data.startsWith('v_no_')) {
         const parts = data.split('_');
         const support = parts[1] === 'yes';
         const proposalId = parseInt(parts[2]!, 10);
@@ -288,88 +737,54 @@ bot.on("callback_query:data", async (ctx) => {
 
         if (!chatId) return;
 
-        // 1. Send data to PostgreSQL
         const voteResult = await castVote(ctx.from.id, chatId, proposalId, support);
 
-        // 2. Handle unauthorized clicks OR already voted (Alert popup)
         if (!voteResult.success) {
-            await ctx.answerCallbackQuery({ text: voteResult.message!, show_alert: true }).catch((err: any) => console.warn("Could not answer callback:", err.message));
+            await ctx
+                .answerCallbackQuery({ text: voteResult.message!, show_alert: true })
+                .catch((err: any) => console.warn('Could not answer callback:', err.message));
             return;
         }
 
-        // 3. User-Specific Update: Show a private alert to the voter with the live tally
-        await ctx.answerCallbackQuery({ 
-            text: `✅ Vote recorded: ${support ? 'Approve' : 'Reject'}\n\nCurrent Tally:\n👍 ${voteResult.yesVotes} | 👎 ${voteResult.noVotes}\nQuorum: ${voteResult.totalVotes}/${voteResult.requiredQuorum}`,
-            show_alert: true 
-        }).catch((err: any) => console.warn("Could not answer callback:", err.message));
+        await ctx
+            .answerCallbackQuery({
+                text: `✅ Vote recorded: ${support ? 'Approve' : 'Reject'}\n\nCurrent Tally:\n👍 ${voteResult.yesVotes} | 👎 ${voteResult.noVotes}\nQuorum: ${voteResult.totalVotes}/${voteResult.requiredQuorum}`,
+                show_alert: true,
+            })
+            .catch((err: any) => console.warn('Could not answer callback:', err.message));
 
         const p = voteResult.proposal!;
+        const messageId = ctx.callbackQuery.message?.message_id;
+        if (!messageId) return;
 
-        // 4. Update the public message state based on Quorum
         if (voteResult.newStatus === 'ACTIVE') {
-            // Still active? Update ONLY the inline keyboard buttons to show the tally.
-            // This prevents the original message text (and AI summary) from being wiped out!
-            const votingKeyboard = new InlineKeyboard()
-                .text(`👍 Approve (${voteResult.yesVotes})`, `v_yes_${p.id}`)
-                .text(`👎 Reject (${voteResult.noVotes})`, `v_no_${p.id}`);
-                
-            await ctx.editMessageReplyMarkup({ 
-                reply_markup: votingKeyboard 
-            });
-        } else {
-            // Quorum reached! Rebuild the final conclusion text
-            let responseText = 
-                `📋 **Proposal #${p.id}**\n\n` +
-                `**Action:** ${p.action}\n` +
-                `**Amount:** ${p.amount} ${p.tokenIn}\n` +
-                (p.tokenOut ? `**Target Asset:** ${p.tokenOut}\n` : "") +
-                (p.platform ? `**Protocol:** ${p.platform}\n` : "") +
-                `\n📊 **Final Tally:**\n` +
-                `👍 Approve: ${voteResult.yesVotes}\n` +
-                `👎 Reject: ${voteResult.noVotes}\n` +
-                `_Quorum: ${voteResult.totalVotes} / ${voteResult.requiredQuorum} reached_`;
-
-            const statusIcon = voteResult.newStatus === 'PASSED' ? '✅' : '❌';
-            responseText += `\n\n🏁 **Voting Concluded: ${voteResult.newStatus} ${statusIcon}**`;
-            
-            // Generate a UI preview of the payload
-            if (voteResult.newStatus === 'PASSED') {
-                try {
-                    const endpoint = await getHttpEndpoint();
-                    const client = new TonClient({ endpoint });
-
-                    const treasuryAddressStr = await getGroupTreasuryAddress(chatId);
-                    if (!treasuryAddressStr) throw new Error("Treasury missing.");
-
-                    let payloadResult;
-
-                    if (p.action === 'SWAP') {
-                        payloadResult = await getDynamicSwapPayload(
-                            client, treasuryAddressStr, p.tokenIn, p.tokenOut!, p.amount
-                        );
-                    } 
-                    else if (p.action === 'STAKE') {
-                        const pairedToken = p.tokenOut || "USDT";
-                        payloadResult = await getDynamicLpPayload(
-                            client, treasuryAddressStr, p.tokenIn, pairedToken, p.amount
-                        );
-                    } 
-                    else if (p.action === 'TRANSFER') {
-                        payloadResult = buildNativeTransferPayload(p.amount);
-                    }
-
-                    if (payloadResult) {
-                        responseText += `\n\n⚙️ **Execution Payload Generated:**\n\`${payloadResult.bocBase64}\``;
-                        responseText += `\n_Gas Required: ~${payloadResult.forwardTon} TON_`;
-                    }
-
-                } catch (err: any) {
-                    console.error("UI Payload preview error:", err);
-                    responseText += `\n\n⚠️ *Payload preview generation pending background execution...*`;
+            await postProposalMessage(
+                chatId,
+                messageId,
+                p,
+                p.proposer,
+                {
+                    yesVotes: voteResult.yesVotes!,
+                    noVotes: voteResult.noVotes!,
+                    requiredQuorum: voteResult.requiredQuorum!,
+                    totalEligible: voteResult.totalEligible!,
                 }
-            }
-
-            await ctx.editMessageText(responseText, { parse_mode: "Markdown" });
+            );
+        } else {
+            await postProposalMessage(
+                chatId,
+                messageId,
+                p,
+                p.proposer,
+                {
+                    yesVotes: voteResult.yesVotes!,
+                    noVotes: voteResult.noVotes!,
+                    requiredQuorum: voteResult.requiredQuorum!,
+                    totalEligible: voteResult.totalEligible!,
+                },
+                true,
+                voteResult.newStatus
+            );
         }
         return;
     }
@@ -380,18 +795,33 @@ bot.catch((err: any) => {
     console.error(`[Error] Update ${ctx.update.update_id} failed:`);
     const e = err.error;
     if (e instanceof GrammyError) {
-        console.error("Error in request:", e.description);
+        console.error('Error in request:', e.description);
     } else if (e instanceof HttpError) {
-        console.error("Could not contact Telegram:", e);
+        console.error('Could not contact Telegram:', e);
     } else {
-        console.error("Unknown error:", e);
+        console.error('Unknown error:', e);
     }
 });
 
+registerApiRoutes(app, bot);
+
 bot.start({
-    onStart: (botInfo: any) => {
+    onStart: (botInfo: { username?: string; can_join_groups?: boolean }) => {
         console.log(`🚀 StonMaker Bot (@${botInfo.username}) is running!`);
-        startExecutionWorker(); // Ignite the background process
+        console.log(`🔗 TON network: ${getTonNetworkLabel()}`);
+        if (botInfo.can_join_groups === false) {
+            console.error(
+                '⚠️ This bot cannot be added to groups. In @BotFather run /setjoingroups and choose Enable.'
+            );
+        }
+        void syncAllKnownGroupsTelegramMeta(bot.api);
+        startExecutionWorker(async (notice) => {
+            try {
+                await notifyProposalExecuted(notice);
+            } catch (error) {
+                console.error(`Could not post execution notice for proposal #${notice.proposalId}:`, error);
+            }
+        });
     },
 });
 

@@ -45,6 +45,9 @@ model Group {
   id              Int           @id @default(autoincrement())
   telegramChatId  BigInt        @unique // The Telegram Group Chat ID
   name            String
+  adminNotified   Boolean?      // One-time flag: admins told to /start the bot in DM
+  telegramUsername String?      // Public @username (without @), synced from Telegram
+  inviteLink      String?       // Primary invite link, synced when bot can read/export it
   
   // Relations
   members         GroupMember[]
@@ -63,6 +66,7 @@ model GroupMember {
   
   role            Role          @default(GUEST)
   joinStatus      RequestStatus @default(NONE)
+  tonWallet       String?       // Per-group wallet address
   
   user            User          @relation(fields: [userId], references: [id])
   group           Group         @relation(fields: [groupId], references: [id])
@@ -96,6 +100,9 @@ model Proposal {
   platform        String?
   destination     String?
   status          String        @default("ACTIVE") // ACTIVE, EXECUTED, FAILED
+  expiresAt       DateTime?     // When voting period ends
+  txHash          String?       // On-chain transaction hash after execution
+  telegramMessageId Int?        // Group message to update when voting / execution completes
 
   group           Group         @relation(fields: [groupId], references: [id])
   proposer        User          @relation(fields: [proposerId], references: [id])
